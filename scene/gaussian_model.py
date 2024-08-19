@@ -14,6 +14,7 @@ import gc
 import copy 
 import numpy as np
 from utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation
+from pytorch3d.renderer import PerspectiveCameras
 from torch import nn
 import os
 import open3d as o3d
@@ -22,11 +23,15 @@ from plyfile import PlyData, PlyElement
 from random import randint
 from utils.sh_utils import RGB2SH
 from simple_knn._C import distCUDA2
+from waymo_open_dataset import dataset_pb2 as open_dataset
+from waymo_open_dataset.wdl_limited.camera.ops import py_camera_model_ops
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
 # from utils.point_utils import addpoint, combine_pointcloud, downsample_point_cloud_open3d, find_indices_in_A
 from scene.deformation import deform_network
 from scene.regulation import compute_plane_smoothness
+import math
+
 class GaussianModel:
 
     def setup_functions(self):
@@ -66,6 +71,17 @@ class GaussianModel:
         self.percent_dense = 0
         self.spatial_lr_scale = 0
         self._deformation_table = torch.empty(0)
+
+
+
+
+        self._theta_num = 1280
+        self._phi_num = 764
+        theta_i = np.linspace(0, 2 * math.pi,  self._theta_num )
+        phi_i = np.linspace(-math.pi / 2, math.pi / 2, self._phi_num)
+        self._theta_phis = torch.tensor(np.array([[(theta, phi) for theta in theta_i] for phi in phi_i])).float().cuda() 
+        self._front_view_feature = torch.zeros((self._theta_num, self._phi_num, (self.max_sh_degree + 1) ** 2)).float().cuda()
+
         self.setup_functions()
 
     def capture(self):
@@ -139,6 +155,52 @@ class GaussianModel:
         if self.active_sh_degree < self.max_sh_degree:
             self.active_sh_degree += 1
 
+
+    def project_pointcloud_to_image(self, points,  calibration, image_size):
+        cameras = PerspectiveCameras(R=calibration.extrinsic.R, 
+                                    T=calibration.extrinsic.T, 
+                                    focal_length=-calibration.intrinsic.f, 
+                                    principal_point=calibration.intrinsic.p, 
+                                    image_size=(image_size,))
+        return cameras.get_world_to_view_transform().transform_points(points)
+      
+
+    def create_from_range_img(self, range_image_value):
+        '''
+            range_image_value: H * W * (1 + 48)
+        '''
+        features = range_image_value[:, :, 1:].reshape(-1, 3, (self.max_sh_degree + 1) ** 2)
+        x = range_image_value[:, :,0] * math.cos(self._theta_phis[:, :,0]) * math.sin(self._theta_phis[:, : ,1])
+        y = range_image_value[:, :,0] * math.cos(self._theta_phis[:, :,0]) * math.cos(self._theta_phis[:, : ,1]) 
+        z = range_image_value[:, :,0] * math.sin(self._theta_phis[:, :,0])
+        fused_point_cloud = torch.stack([x, y, z], 0)
+        dist2 = torch.clamp_min(distCUDA2(fused_point_cloud.float().cuda()), 0.0000001)
+        scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 3)
+        rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
+        rots[:, 0] = 1
+        opacities = inverse_sigmoid(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
+        self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
+        self._deformation = self._deformation.to("cuda") 
+        # self.grid = self.grid.to("cuda")
+        self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
+        self._features_rest = nn.Parameter(features[:,:,1:].transpose(1, 2).contiguous().requires_grad_(True))
+        self._scaling = nn.Parameter(scales.requires_grad_(True))
+        self._rotation = nn.Parameter(rots.requires_grad_(True))
+        self._opacity = nn.Parameter(opacities.requires_grad_(True))
+        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        self._deformation_table = torch.gt(torch.ones((self.get_xyz.shape[0]),device="cuda"),0)
+        
+
+    def update_range_image_features(self, range_image_key, range_image_value, range_image_pos, raw_image_key, raw_image_value, raw_image_pose, calibration):
+        x = range_image_value[:, :,0] * math.cos(self._theta_phis[:, :,0]) * math.sin(self._theta_phis[:, : ,1])
+        y = range_image_value[:, :,0] * math.cos(self._theta_phis[:, :,0]) * math.cos(self._theta_phis[:, : ,1]) 
+        z = range_image_value[:, :,0] * math.sin(self._theta_phis[:, :,0])
+        fused_point_cloud = torch.stack([x, y, z], 0)
+        project_points = self.project_pointcloud_to_image(fused_point_cloud, raw_image_pose, calibration)
+
+
+
+
     def create_from_pcd(self, pcd : BasicPointCloud, spatial_lr_scale : float,):
         self.spatial_lr_scale = spatial_lr_scale
         # breakpoint()
@@ -167,6 +229,7 @@ class GaussianModel:
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
         self._deformation_table = torch.gt(torch.ones((self.get_xyz.shape[0]),device="cuda"),0)
+
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
@@ -208,7 +271,7 @@ class GaussianModel:
                 param_group['lr'] = lr
                 lr_pos = lr
             if  "grid" in param_group["name"]: # 这里也有
-                lr = self.grid_scheduler_args(iteration)
+                lr = self.grid_scheduler_args(iteration)import math
                 param_group['lr'] = lr
                 # return lr
             elif param_group["name"] == "deformation": # 这里一开始就会进
@@ -231,7 +294,6 @@ class GaussianModel:
             l.append('rot_{}'.format(i))
         return l
     def compute_deformation(self,time):
-        
         deform = self._deformation[:,:,:time].sum(dim=-1)
         xyz = self._xyz + deform
         return xyz
@@ -283,7 +345,10 @@ class GaussianModel:
         # dynamic and static
         # 如果提供了掩码，仅选择掩码为True的点
         # for dx in dx_list:
-        dx = dx_list [24]
+        if  dx_list is not None and  len(dx_list) > 24:
+            dx = dx_list [24]
+        else:
+            dx = torch.zeros_like(self._xyz)
         if True:
             # update xyz
             self._xyz = self._xyz + dx
