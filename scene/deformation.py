@@ -176,6 +176,12 @@ class Deformation(nn.Module):
             if  "grid" in name:
                 parameter_list.append(param)
         return parameter_list
+    
+
+        
+
+
+
 class deform_network(nn.Module):
     def __init__(self, args) :
         super(deform_network, self).__init__()

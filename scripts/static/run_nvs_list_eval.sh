@@ -10,20 +10,21 @@ data_list=(
 
 DATE=$(date '+%m%d')
 output_root="./work_dirs/$DATE/static"
-project=reconstuction100
+project=nvs100
 
 for data_dir in "${data_list[@]}"; do
-    # è·å–å­ç›®å½•çš„basename
+    # »ñÈ¡×ÓÄ¿Â¼µÄbasename
     model_name=$(basename "$data_dir")
 
-    # ä½¿ç”¨basenameæ¥ä¿®æ”¹model_path
+    # Ê¹ÓÃbasenameÀ´ĞŞ¸Ämodel_path
     model_path="$output_root/$project/$model_name"
 
-    # æ‰§è¡Œç›¸åŒçš„å‘½ä»¤ï¼Œåªä¿®æ”¹-så’Œ--model_pathå‚æ•°
+    # Ö´ĞĞÏàÍ¬µÄÃüÁî£¬Ö»ĞŞ¸Ä-sºÍ--model_path²ÎÊı
     CUDA_VISIBLE_DEVICES=$1 proxychains python train.py \
         -s "$data_dir" \
         --model_path "$model_path" \
         --expname 'waymo' \
+        --configs "arguments/nvs.py" --eval_only
 
 done
-# bash scripts/static/run_recon_list.sh 2
+# bash scripts/static/run_nvs_list_2.sh 5

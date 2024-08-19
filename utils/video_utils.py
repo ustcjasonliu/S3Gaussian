@@ -122,7 +122,7 @@ def render_func(
     return_decomposition:bool = False,
     num_cams: int = 3,
     debug: bool = False,
-    save_seperate_pcd = False
+    save_seperate_pcd = True
 ):
     """
     Renders a dataset utilizing a specified render function.

@@ -1,12 +1,10 @@
 #!/bin/bash
 
-
 data_list=(
-    "/data1/hn/gaussianSim/data/processed/static32/training/003"
-    "/data1/hn/gaussianSim/data/processed/static32/training/019"
-    "/data1/hn/gaussianSim/data/processed/static32/training/036"
+    "./data/waymo/processed/static32/003"
+    "./data/waymo/processed/static32/019"
+    "./data/waymo/processed/static32/036"
 )
-
 
 DATE=$(date '+%m%d')
 output_root="./work_dirs/$DATE/static"

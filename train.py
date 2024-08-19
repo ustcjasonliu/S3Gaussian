@@ -392,7 +392,7 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
         gt_depth_tensor = torch.cat(gt_depths,0).float()
         # Loss
         # breakpoint()
-        Ll1 = l1_loss(image_tensor, gt_image_tensor[:,:3,:,:])
+        Ll1 = l1_loss(image_tensor, gt_image_tensor[:,:3,:,:]) # rgb loss
 
         psnr_ = psnr(image_tensor, gt_image_tensor).mean().double()
         # if 'fine' in stage:
@@ -408,7 +408,7 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
             dshs_abs = torch.abs(render_pkg['dshs'])
             dshs_loss = torch.mean(dshs_abs) * opt.lambda_dshs
             loss += dshs_loss
-        if opt.lambda_depth != 0:
+        if opt.lambda_depth != 0:   # depth  
             depth_loss = compute_depth("l2", depth_pred_tensor, gt_depth_tensor) * opt.lambda_depth
             loss += depth_loss
         if stage == "fine" and hyper.time_smoothness_weight != 0:
@@ -481,6 +481,7 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                     # breakpoint()
                         if len(test_cams) != 0:
                             render_training_image(scene, gaussians, [test_cams[iteration%len(test_cams)]], render, pipe, background, stage+"test", iteration,timer.get_elapsed_time())
+            
                         render_training_image(scene, gaussians, [train_cams[iteration%len(train_cams)]], render, pipe, background, stage+"train", iteration,timer.get_elapsed_time())
 
                     # total_images.append(to8b(temp_image).transpose(1,2,0))

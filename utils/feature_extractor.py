@@ -57,7 +57,7 @@ def extract_and_save_features(
     ):
         image_pth = input_img_path_list[i]
         feat_pth = saved_feat_path_list[i]
-
+        print("image path", image_pth, "feature path ", feat_pth)
         file_exists = os.path.exists(feat_pth)
         if file_exists:
             continue

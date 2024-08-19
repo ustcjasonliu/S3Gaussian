@@ -2,9 +2,7 @@
 
 
 data_list=(
-    # "/data1/hn/gaussianSim/data/processed/dynamic32/training/016"
-    # "/data1/hn/gaussianSim/data/processed/dynamic32/training/021"
-    "/data1/hn/gaussianSim/data/processed/dynamic32/training/022"
+    "./data/waymo/processed/dynamic32/016"
 )
 
 
