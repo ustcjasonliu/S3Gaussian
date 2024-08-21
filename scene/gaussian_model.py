@@ -80,6 +80,7 @@ class GaussianModel:
 
         self._range_image = None
         self._gaussian_feature = None
+        self._prev_pose = None
 
         self._theta_num = 1280
         self._phi_num = 764
@@ -170,8 +171,18 @@ class GaussianModel:
 
     def oneupSHdegree(self):
         if self.active_sh_degree < self.max_sh_degree:
-            self.active_sh_degree += 1
-      
+            self.active_sh_degree += 1 
+
+
+    def update_gaussians(self, current_pose):
+        if self._prev_pose:
+            self.update_range_image_by_history(self._prev_pose, current_pose)
+        else:
+            self.update_range_image_by_history(current_pose, current_pose)
+        self._range_image = self.update_range_image_by_neighbour(self._range_image)
+        self.create_gaussians_from_range_img(self._range_image)
+
+        self._prev_pose = current_pose
 
     def create_gaussians_from_range_img(self, range_image_value):
         '''
@@ -179,9 +190,9 @@ class GaussianModel:
         '''
         features = self.reg_ffn(range_image_value)
         features = features[:, :, 1:].reshape(-1, 3, (self.max_sh_degree + 1) ** 2)
-        x = range_image_value[:, :,0] * math.cos(self._theta_phis[:, :,0]) * math.sin(self._theta_phis[:, : ,1])
-        y = range_image_value[:, :,0] * math.cos(self._theta_phis[:, :,0]) * math.cos(self._theta_phis[:, : ,1]) 
-        z = range_image_value[:, :,0] * math.sin(self._theta_phis[:, :,0])
+        x = features[:, :,0] * math.cos(self._theta_phis[:, :,0]) * math.sin(self._theta_phis[:, : ,1])
+        y = features[:, :,0] * math.cos(self._theta_phis[:, :,0]) * math.cos(self._theta_phis[:, : ,1]) 
+        z = features[:, :,0] * math.sin(self._theta_phis[:, :,0])
         fused_point_cloud = torch.stack([x, y, z], 0)
         dist2 = torch.clamp_min(distCUDA2(fused_point_cloud.float().cuda()), 0.0000001)
         scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 3)
