@@ -15,9 +15,13 @@ import copy
 import numpy as np
 from utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation
 from pytorch3d.renderer import PerspectiveCameras
+from scene.range_image_fusion.range_image_deformable_transformer_head import RangeImageDeformableTransformer
 from torch import nn
+from mmcv.cnn.bricks.transformer import FFN
 import os
+import torch.nn.functional as F
 import open3d as o3d
+from einops import rearrange
 from utils.system_utils import mkdir_p
 from plyfile import PlyData, PlyElement
 from random import randint
@@ -30,7 +34,8 @@ from utils.general_utils import strip_symmetric, build_scaling_rotation
 # from utils.point_utils import addpoint, combine_pointcloud, downsample_point_cloud_open3d, find_indices_in_A
 from scene.deformation import deform_network
 from scene.regulation import compute_plane_smoothness
-import math
+import math 
+
 
 class GaussianModel:
 
@@ -73,14 +78,26 @@ class GaussianModel:
         self._deformation_table = torch.empty(0)
 
 
-
+        self._range_image = None
+        self._gaussian_feature = None
 
         self._theta_num = 1280
         self._phi_num = 764
+        self.embed_dims = 49
+        self.act_cfg = dict(type='ReLU', inplace=True)
         theta_i = np.linspace(0, 2 * math.pi,  self._theta_num )
         phi_i = np.linspace(-math.pi / 2, math.pi / 2, self._phi_num)
         self._theta_phis = torch.tensor(np.array([[(theta, phi) for theta in theta_i] for phi in phi_i])).float().cuda() 
         self._front_view_feature = torch.zeros((self._theta_num, self._phi_num, (self.max_sh_degree + 1) ** 2)).float().cuda()
+        self._theta_res = 2 * math.pi / self._theta_num
+        self._phi_res = math.pi / self._phi_num
+        self._range_image_deformable_net = RangeImageDeformableTransformer
+        self.reg_ffn = FFN(self.embed_dims,
+                           self.embed_dims,
+                           self.num_reg_fcs,
+                           self.act_cfg,
+                           dropout=0.0,
+                           add_residual=False)
 
         self.setup_functions()
 
@@ -154,22 +171,14 @@ class GaussianModel:
     def oneupSHdegree(self):
         if self.active_sh_degree < self.max_sh_degree:
             self.active_sh_degree += 1
-
-
-    def project_pointcloud_to_image(self, points,  calibration, image_size):
-        cameras = PerspectiveCameras(R=calibration.extrinsic.R, 
-                                    T=calibration.extrinsic.T, 
-                                    focal_length=-calibration.intrinsic.f, 
-                                    principal_point=calibration.intrinsic.p, 
-                                    image_size=(image_size,))
-        return cameras.get_world_to_view_transform().transform_points(points)
       
 
-    def create_from_range_img(self, range_image_value):
+    def create_gaussians_from_range_img(self, range_image_value):
         '''
             range_image_value: H * W * (1 + 48)
         '''
-        features = range_image_value[:, :, 1:].reshape(-1, 3, (self.max_sh_degree + 1) ** 2)
+        features = self.reg_ffn(range_image_value)
+        features = features[:, :, 1:].reshape(-1, 3, (self.max_sh_degree + 1) ** 2)
         x = range_image_value[:, :,0] * math.cos(self._theta_phis[:, :,0]) * math.sin(self._theta_phis[:, : ,1])
         y = range_image_value[:, :,0] * math.cos(self._theta_phis[:, :,0]) * math.cos(self._theta_phis[:, : ,1]) 
         z = range_image_value[:, :,0] * math.sin(self._theta_phis[:, :,0])
@@ -188,17 +197,41 @@ class GaussianModel:
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
-        self._deformation_table = torch.gt(torch.ones((self.get_xyz.shape[0]),device="cuda"),0)
-        
-
-    def update_range_image_features(self, range_image_key, range_image_value, range_image_pos, raw_image_key, raw_image_value, raw_image_pose, calibration):
-        x = range_image_value[:, :,0] * math.cos(self._theta_phis[:, :,0]) * math.sin(self._theta_phis[:, : ,1])
-        y = range_image_value[:, :,0] * math.cos(self._theta_phis[:, :,0]) * math.cos(self._theta_phis[:, : ,1]) 
-        z = range_image_value[:, :,0] * math.sin(self._theta_phis[:, :,0])
-        fused_point_cloud = torch.stack([x, y, z], 0)
-        project_points = self.project_pointcloud_to_image(fused_point_cloud, raw_image_pose, calibration)
+        self._deformation_table = torch.gt(torch.ones((self.get_xyz.shape[0]),device="cuda"), 0)
 
 
+    # Update range image by neighbour information
+    def update_range_image_by_neighbour(self, range_image):
+        reshaped_range_images = [rearrange(range_image, 'h w d-> d h w ')]      
+        range_image_masks = reshaped_range_images[0].new_zeros((reshaped_range_images[0].shape[0],reshaped_range_images[0].shape[1],reshaped_range_images[0].shape[2]))
+        range_image_maskss = []
+        range_image_positional_encodings = []
+        for reshaped_range_image in reshaped_range_images:
+            range_image_maskss.append(
+                F.interpolate(range_image_masks[None], size=reshaped_range_image.shape[-2:]).to(torch.bool).squeeze(0))
+            range_image_positional_encodings.append(
+                self.positional_encoding(range_image_maskss[-1]))        
+        updated_range_image, _, _ = self._range_image_deformable_net.forward(reshaped_range_images, range_image_maskss, range_image_positional_encodings, reshaped_range_images)
+        return updated_range_image
+
+
+    def convert_cartesian_to_polar(self, xyz):
+        r = torch.sqrt(xyz[:, 0]**2 + xyz[:, 1]**2 + xyz[:, 2]**2)
+        theta = torch.atan2(torch.sqrt(xyz[:, 0]**2 + xyz[:, 1]**2), xyz[:, 2])
+        phi = torch.atan2(xyz[:, 1], xyz[:, 0])
+        polar_coords = torch.stack([r, theta, phi], dim=0)
+        return polar_coords
+
+    '''
+        convert prior gaussian to current polar coord and extrat features
+    '''
+    def update_range_image_by_history(self, prev_pose, current_pose):
+        transformed_xyz = torch.inverse(current_pose) * prev_pose @ self._xyz
+        transformed_polar = self.convert_cartesian_to_polar(transformed_xyz)
+        transformed_polar_coord =  torch.stack([transformed_polar[1] / self._theta_res,
+                                                 transformed_polar / self._phi_res], 0)
+        self._range_image[transformed_polar_coord] = self._range_image
+     
 
 
     def create_from_pcd(self, pcd : BasicPointCloud, spatial_lr_scale : float,):
@@ -229,6 +262,12 @@ class GaussianModel:
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
         self._deformation_table = torch.gt(torch.ones((self.get_xyz.shape[0]),device="cuda"),0)
+
+        transformed_polar = self.convert_cartesian_to_polar(self._xyz)
+        transformed_polar_coord =  torch.stack([transformed_polar[1] / self._theta_res,
+                                                 transformed_polar / self._phi_res], 0)
+        self._range_image[transformed_polar_coord] = features
+        
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
@@ -459,6 +498,11 @@ class GaussianModel:
         self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
         self.active_sh_degree = self.max_sh_degree
 
+        transformed_polar = self.convert_cartesian_to_polar(self._xyz)
+        transformed_polar_coord =  torch.stack([transformed_polar[1] / self._theta_res,
+                                                 transformed_polar / self._phi_res], 0)
+        self._range_image[transformed_polar_coord] = torch.concat([features_dc, features_extra], dim = 2)
+
     def replace_tensor_to_optimizer(self, tensor, name):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
@@ -589,7 +633,7 @@ class GaussianModel:
     def densify_and_clone(self, grads, grad_threshold, scene_extent, density_threshold=20, displacement_scale=20, model_path=None, iteration=None, stage=None):
         grads_accum_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
         
-        # 主动增加稀疏点云
+        # 主动增加稀疏点�?
         # if not hasattr(self,"voxel_size"):
         #     self.voxel_size = 8  
         # if not hasattr(self,"density_threshold"):
@@ -608,7 +652,7 @@ class GaussianModel:
         # global_mask = torch.zeros((point_cloud.shape[0]), dtype=torch.bool).to(grads_accum_mask)
         # global_mask[sparse_point_mask] = low_density_index
         # selected_pts_mask_grow = torch.logical_and(global_mask, grads_accum_mask)
-        # print("降采样点云:",sparse_point_mask.sum(),"选中的稀疏点云：",global_mask.sum(),"梯度累计点云：",grads_accum_mask.sum(),"选中增长点云：",selected_pts_mask_grow.sum())
+        # print("降采样点�?:",sparse_point_mask.sum(),"选中的稀疏点云：",global_mask.sum(),"梯度累计点云�?",grads_accum_mask.sum(),"选中增长点云�?",selected_pts_mask_grow.sum())
         # Extract points that satisfy the gradient condition
         selected_pts_mask = torch.logical_and(grads_accum_mask,
                                               torch.max(self.get_scaling, dim=1).values <= self.percent_dense*scene_extent)
@@ -624,8 +668,8 @@ class GaussianModel:
         # if opt.add_point:
         # selected_xyz, grow_xyz = self.add_point_by_mask(selected_pts_mask_grow.to(self.get_xyz.device), self.displacement_scale)
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_deformation_table)
-        # print("被动增加点云：",selected_xyz.shape[0])
-        # print("主动增加点云：",selected_pts_mask.sum())
+        # print("被动增加点云�?",selected_xyz.shape[0])
+        # print("主动增加点云�?",selected_pts_mask.sum())
         # if model_path is not None and iteration is not None:
         #     point = combine_pointcloud(self.get_xyz.detach().cpu().numpy(), new_xyz.detach().cpu().numpy(), selected_xyz.detach().cpu().numpy())
         #     write_path = os.path.join(model_path,"add_point_cloud")
@@ -820,22 +864,22 @@ def merge_models(old_model:GaussianModel, new_model:GaussianModel,hyper,merged_m
     if merged_model is None:
         merged_model = GaussianModel(old_model.max_sh_degree, hyper)
 
-    # 合并时需要的参数化属性列表
+    # 合并时需要的参数化属性列�?
     parameterized_attributes = ['_xyz', '_features_dc', '_features_rest', '_opacity', '_scaling', '_rotation']
 
-    # 遍历模型的属性
+    # 遍历模型的属�?
     for attr in new_model.__dict__.keys():
         attr_value_static = getattr(old_model, attr)
         attr_value_dynamic = getattr(new_model, attr)
         if isinstance(attr_value_dynamic, torch.Tensor):
-            # 检查是否是参数化属性
+            # 检查是否是参数化属�?
             if attr in parameterized_attributes:
-                # 创建一个合并后的tensor，其中包含动态和静态部分
+                # 创建一个合并后的tensor，其中包含动态和静态部�?
                 if isinstance(attr_value_static.data, torch.Tensor) and isinstance(attr_value_dynamic.data, torch.Tensor):
                     combined_data = torch.cat([attr_value_dynamic.data, attr_value_static.data], dim=0)
                     setattr(merged_model, attr, torch.nn.Parameter(combined_data))
             else:
-                # 非参数化属性但是是tensor，同样合并
+                # 非参数化属性但是是tensor，同样合�?
                 combined_data = torch.cat([attr_value_dynamic, attr_value_static], dim=0)
                 setattr(merged_model, attr, combined_data)
             del attr_value_dynamic
